@@ -1,19 +1,13 @@
-print(f"Type A: {type(tok_a).__name__}")
-print(f"Type B: {type(scorer.tokenizer).__name__}")
+import sentencepiece as spm
 
-print(f"\nPath A resolved: {tok_a.name_or_path}")
-print(f"Path B resolved: {scorer.tokenizer.name_or_path}")
+# Check if the sp_model is actually functional in each
+print(f"A sp_model type: {type(tok_a.sp_model)}")
+print(f"B sp_model type: {type(scorer.tokenizer.sp_model)}")
 
-# Check if spm.model is actually being loaded
-print(f"\nVocab file A: {getattr(tok_a, 'vocab_file', 'NONE')}")
-print(f"Vocab file B: {getattr(scorer.tokenizer, 'vocab_file', 'NONE')}")
+print(f"\nA sp_model piece size: {tok_a.sp_model.get_piece_size()}")
+print(f"B sp_model piece size: {scorer.tokenizer.sp_model.get_piece_size()}")
 
-# Check the tokenizer_config.json directly
-import json, os
-config_path = os.path.join(path, 'tokenizer_config.json')
-if os.path.exists(config_path):
-    with open(config_path) as f:
-        tc = json.load(f)
-    print(f"\ntokenizer_config.json:")
-    print(f"  tokenizer_class: {tc.get('tokenizer_class', 'NOT SET')}")
-    print(f"  model_type: {tc.get('model_type', 'NOT SET')}")
+# Direct SentencePiece test
+test = "i recommend rolling over"
+print(f"\nA sp_model.encode: {tok_a.sp_model.encode(test, out_type=str)}")
+print(f"B sp_model.encode: {scorer.tokenizer.sp_model.encode(test, out_type=str)}")
