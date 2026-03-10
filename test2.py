@@ -1,13 +1,11 @@
-import sentencepiece as spm
+print(f"A is_fast: {tok_a.is_fast}")
+print(f"B is_fast: {scorer.tokenizer.is_fast}")
 
-# Check if the sp_model is actually functional in each
-print(f"A sp_model type: {type(tok_a.sp_model)}")
-print(f"B sp_model type: {type(scorer.tokenizer.sp_model)}")
-
-print(f"\nA sp_model piece size: {tok_a.sp_model.get_piece_size()}")
-print(f"B sp_model piece size: {scorer.tokenizer.sp_model.get_piece_size()}")
-
-# Direct SentencePiece test
-test = "i recommend rolling over"
-print(f"\nA sp_model.encode: {tok_a.sp_model.encode(test, out_type=str)}")
-print(f"B sp_model.encode: {scorer.tokenizer.sp_model.encode(test, out_type=str)}")
+# Check what files exist
+import os
+model_dir = "models/deberta_distribution/final_model/best_model"
+for f in ['tokenizer.json', 'spm.model', 'tokenizer_config.json']:
+    full = os.path.join(model_dir, f)
+    exists = os.path.exists(full)
+    size = os.path.getsize(full) if exists else 0
+    print(f"  {f}: {'exists' if exists else 'MISSING'} ({size/1024:.0f} KB)")
