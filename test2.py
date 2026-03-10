@@ -1,43 +1,23 @@
-import torch, numpy as np, pandas as pd
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from hybrid_inference_pipeline import DeBERTaScorer, HybridConfig
+print("Tok A type:", type(tok_a).__name__)
+print("Tok B type:", type(scorer.tokenizer).__name__)
 
-path = "models/deberta_distribution/final_model/best_model"
-holdout = pd.read_csv("data/holdout.csv")
-texts = holdout['passage'].head(5).tolist()
-labels = holdout['type'].head(5).values
+print("\nTok A vocab size:", tok_a.vocab_size)
+print("Tok B vocab size:", scorer.tokenizer.vocab_size)
 
-# ── Path A: direct (works at 92%) ──
-tok_a = AutoTokenizer.from_pretrained(path, local_files_only=True)
-model_a = AutoModelForSequenceClassification.from_pretrained(path, local_files_only=True)
-model_a.eval()
-enc_a = tok_a(texts, padding=True, truncation=True, max_length=320, return_tensors='pt')
-with torch.no_grad():
-    logits_a = model_a(**enc_a).logits
+# Check the actual token IDs for one text
+ids_a = enc_a['input_ids'][0][:15].tolist()
+ids_b = enc_b['input_ids'][0][:15].tolist()
+print(f"\nFirst 15 token IDs A: {ids_a}")
+print(f"First 15 token IDs B: {ids_b}")
 
-# ── Path B: through DeBERTaScorer (gets 54%) ──
-config = HybridConfig(deberta_model_path=path)
-scorer = DeBERTaScorer(config)
-enc_b = scorer.tokenizer(texts, padding=True, truncation=True,
-                          max_length=config.deberta_max_length, return_tensors='pt')
+# Decode back to see what each tokenizer produced
+print(f"\nDecoded A: {tok_a.convert_ids_to_tokens(ids_a)}")
+print(f"Decoded B: {scorer.tokenizer.convert_ids_to_tokens(ids_b)}")
 
-with torch.no_grad():
-    logits_b = scorer.model(**enc_b).logits
-
-# ── Compare everything ──
-print("Token IDs match:", torch.equal(enc_a['input_ids'], enc_b['input_ids']))
-print("Attention mask match:", torch.equal(enc_a['attention_mask'], enc_b['attention_mask']))
-print("Enc A keys:", list(enc_a.keys()))
-print("Enc B keys:", list(enc_b.keys()))
-
-print(f"\nLogits A (direct):\n{logits_a[:5].numpy().round(3)}")
-print(f"Logits B (scorer):\n{logits_b[:5].numpy().round(3)}")
-print(f"Logits match: {torch.allclose(logits_a, logits_b, atol=1e-4)}")
-
-print(f"\nPreds A: {logits_a.argmax(dim=-1).numpy()}")
-print(f"Preds B: {logits_b.argmax(dim=-1).numpy()}")
-print(f"Labels:  {labels}")
-
-# Check if models are the same object in memory
-print(f"\nModel A params: {sum(p.sum().item() for p in model_a.parameters()):.4f}")
-print(f"Model B params: {sum(p.sum().item() for p in scorer.model.parameters()):.4f}")
+# Compare tokenizer configs
+for attr in ['do_lower_case', 'model_max_length', 'padding_side', 
+             'vocab_file', 'sp_model_kwargs', 'split_special_tokens']:
+    val_a = getattr(tok_a, attr, 'N/A')
+    val_b = getattr(scorer.tokenizer, attr, 'N/A')
+    match = "✓" if val_a == val_b else "✗ DIFFERENT"
+    print(f"  {attr}: A={val_a}, B={val_b} {match}")
