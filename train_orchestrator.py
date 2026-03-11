@@ -145,67 +145,36 @@ def train_setfit(train_csv_path, setfit_output_dir, seed=42):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def train_deberta(train_csv_path, deberta_output_dir, seed=42):
-    """Train DeBERTa pipeline (k-fold + final model) on training data."""
+    """Train dual-head DeBERTa (binary + multiclass) on training data."""
     logger.info(f"\n{'='*70}")
-    logger.info("TRAINING DEBERTA")
+    logger.info("TRAINING DUAL-HEAD DEBERTA")
     logger.info(f"{'='*70}")
 
-    from stage2_train_fixed import (
-        TrainConfig, load_raw_data, set_seed, validate_kfold, train_final_model,
-    )
-    from transformers import AutoTokenizer
+    from dual_head_deberta import train_dual_head_pipeline
 
-    config = TrainConfig(
+    train_dual_head_pipeline(
         data_path=train_csv_path,
         output_dir=deberta_output_dir,
         seed=seed,
+
+        # Training config
+        learning_rate=3e-5,
+        num_epochs=15,
+        batch_size=16,
+        gradient_accumulation_steps=1,
+        gradient_checkpointing=False,
+        early_stopping_patience=5,
     )
 
-    set_seed(config.seed)
-
-    # Load training data
-    df = load_raw_data(config)
-    logger.info(f"DeBERTa training on {len(df)} samples")
-
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-
-    # K-fold validation
-    fold_results, calibration_path = validate_kfold(df, config, tokenizer)
-
-    # Save k-fold results
-    os.makedirs(config.output_dir, exist_ok=True)
-    with open(os.path.join(config.output_dir, "kfold_results.json"), 'w') as f:
-        json.dump({
-            'config': {k: str(v) for k, v in config.__dict__.items()},
-            'fold_results': fold_results,
-        }, f, indent=2, default=str)
-
-    # Train final model on all training data
-    final_path = train_final_model(df, config, tokenizer)
-
-    logger.info("DeBERTa training complete\n")
-    return final_path
+    logger.info("Dual-head DeBERTa training complete\n")
 
 
 def export_deberta_onnx(deberta_model_path):
-    """Export DeBERTa to ONNX + quantized ONNX for fast CPU inference."""
-    logger.info(f"\n{'_'*40}")
-    logger.info("Exporting DeBERTa to ONNX")
-    logger.info(f"{'_'*40}")
-
-    onnx_path = os.path.join(deberta_model_path, "model.onnx")
-
-    if os.path.exists(onnx_path) or os.path.exists(onnx_path.replace('.onnx', '_quantized.onnx')):
-        logger.info("  ONNX model already exists, skipping export")
-        return
-
-    try:
-        from inference_pipeline import export_to_onnx
-        export_to_onnx(deberta_model_path, onnx_path)
-    except Exception as e:
-        logger.warning(f"  ONNX export failed: {e}")
-        logger.warning("  Hybrid pipeline will fall back to PyTorch (slower)")
+    """ONNX export for dual-head model — not yet supported.
+    The dual-head model uses custom save/load. ONNX export would require
+    custom export logic for the dual output heads. PyTorch inference is
+    fast enough since DeBERTa only scores the borderline subset."""
+    logger.info("  ONNX export skipped (dual-head model uses PyTorch inference)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -255,29 +224,42 @@ def evaluate_on_holdout(holdout_df, config_dict, label_names):
     # ── DeBERTa alone ──
     try:
         logger.info(f"\n{'_'*40}")
-        logger.info("DeBERTa (alone)")
+        logger.info("DeBERTa dual-head (alone)")
         logger.info(f"{'_'*40}")
 
         deberta_path = config_dict['deberta_model_path']
         if os.path.exists(deberta_path):
-            from hybrid_inference_pipeline import DeBERTaScorer, HybridConfig
-            temp_config = HybridConfig(deberta_model_path=deberta_path)
-            scorer = DeBERTaScorer(temp_config)
+            from dual_head_deberta import DualHeadScorer
 
-            all_probs = []
-            bs = 64
-            for start in range(0, len(holdout_texts), bs):
-                batch = holdout_texts[start:start+bs]
-                all_probs.append(scorer.score_batch(batch))
-            probs = np.concatenate(all_probs, axis=0)
-            preds = np.argmax(probs, axis=1)
+            scorer = DualHeadScorer(deberta_path)
+            multi_probs, binary_probs = scorer.score_all(holdout_texts)
 
-            results['deberta'] = _compute_metrics(holdout_labels, preds, label_names_list, "DeBERTa")
+            # Multiclass metrics
+            multi_preds = np.argmax(multi_probs, axis=1)
+            results['deberta_multi'] = _compute_metrics(
+                holdout_labels, multi_preds, label_names_list, "DeBERTa (4-class)")
+
+            # Binary metrics
+            binary_true = (holdout_labels > 0).astype(int)
+            binary_preds = np.argmax(binary_probs, axis=1)
+            binary_metrics = {
+                'binary_f1': float(f1_score(binary_true, binary_preds, zero_division=0)),
+                'binary_precision': float(precision_score(binary_true, binary_preds, zero_division=0)),
+                'binary_recall': float(recall_score(binary_true, binary_preds, zero_division=0)),
+                'binary_accuracy': float(accuracy_score(binary_true, binary_preds)),
+            }
+            results['deberta_binary'] = binary_metrics
+            logger.info(f"  DeBERTa binary head: f1={binary_metrics['binary_f1']:.4f}, "
+                        f"prec={binary_metrics['binary_precision']:.4f}, "
+                        f"rec={binary_metrics['binary_recall']:.4f}")
+
             del scorer
         else:
             logger.warning(f"  DeBERTa model not found at {deberta_path}")
     except Exception as e:
         logger.warning(f"  DeBERTa evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     # ── Hybrid (after tuning) ──
     try:

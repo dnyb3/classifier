@@ -65,7 +65,8 @@ class DualHeadDeBERTa(nn.Module):
         → head_multi(pooled)  → multi_logits   (batch, num_labels)
     """
 
-    def __init__(self, encoder, pooler, hidden_size, num_labels=4, dropout_rate=0.1):
+    def __init__(self, encoder, pooler, hidden_size, num_labels=4, dropout_rate=0.1,
+                 loss_fn_multi=None, loss_fn_binary=None):
         super().__init__()
         self.encoder = encoder
         self.pooler = pooler
@@ -74,6 +75,13 @@ class DualHeadDeBERTa(nn.Module):
         self.head_multi = nn.Linear(hidden_size, num_labels)
         self.hidden_size = hidden_size
         self.num_labels = num_labels
+        # Store loss functions in a plain dict to avoid nn.Module __setattr__
+        # registering FocalLoss as a submodule (which would pollute the state_dict
+        # and break loading from disk when loss config differs).
+        self._loss_fns = {
+            'multi': loss_fn_multi or F.cross_entropy,
+            'binary': loss_fn_binary or F.cross_entropy,
+        }
 
     def forward(self, input_ids, attention_mask=None, labels=None, labels_binary=None, **kwargs):
         # Encoder forward
@@ -92,29 +100,45 @@ class DualHeadDeBERTa(nn.Module):
         multi_logits = self.head_multi(pooled)
         binary_logits = self.head_binary(pooled)
 
+        # Compute loss when labels provided (training and evaluation)
+        loss = None
+        if labels is not None and labels_binary is not None:
+            loss_multi = self._loss_fns['multi'](multi_logits, labels)
+            loss_binary = self._loss_fns['binary'](binary_logits, labels_binary)
+            loss = loss_multi + loss_binary
+
         return DualHeadOutput(
-            loss=None,  # loss computed by trainer
+            loss=loss,
             multi_logits=multi_logits,
             binary_logits=binary_logits,
-            labels=labels,
-            labels_binary=labels_binary,
         )
 
 
 class DualHeadOutput:
-    """Output container that's compatible with HuggingFace Trainer."""
-    def __init__(self, loss, multi_logits, binary_logits, labels=None, labels_binary=None):
+    """Output container compatible with HuggingFace Trainer.
+    
+    Supports attribute access (.loss, .logits) and tuple-style indexing
+    (outputs[0] = loss, outputs[1:] = (logits,)) for Trainer compatibility.
+    """
+    def __init__(self, loss, multi_logits, binary_logits):
         self.loss = loss
-        # Trainer expects .logits for compute_metrics — concatenate both
-        # so we can split them in compute_metrics
         self.logits = torch.cat([multi_logits, binary_logits], dim=-1)
         self.multi_logits = multi_logits
         self.binary_logits = binary_logits
-        self.labels = labels
-        self.labels_binary = labels_binary
+        self._tuple = (loss, self.logits)
+
+    def __getitem__(self, idx):
+        return self._tuple[idx]
+
+    def __iter__(self):
+        return iter(self._tuple)
+
+    def __len__(self):
+        return len(self._tuple)
 
 
-def load_dual_head_model(model_name: str, num_labels: int = 4, dropout_rate: float = 0.1):
+def load_dual_head_model(model_name: str, num_labels: int = 4, dropout_rate: float = 0.1,
+                         loss_fn_multi=None, loss_fn_binary=None):
     """
     Load pretrained DeBERTa encoder and wrap with dual classification heads.
     Handles the DeBERTa-v3 LayerNorm beta/gamma remapping.
@@ -157,16 +181,24 @@ def load_dual_head_model(model_name: str, num_labels: int = 4, dropout_rate: flo
     encoder = ref_model.deberta
     pooler = ref_model.pooler if hasattr(ref_model, 'pooler') else None
 
-    hidden_size = config.hidden_size
-    print(f"  Hidden size: {hidden_size}, Pooler: {'yes' if pooler else 'no'}")
+    # Use pooler's output dimension for heads, not encoder's hidden_size.
+    # DeBERTa's ContextPooler can output a different size than the encoder.
+    if pooler is not None and hasattr(pooler, 'output_dim'):
+        head_input_size = pooler.output_dim
+    else:
+        head_input_size = config.hidden_size
+    print(f"  Encoder hidden: {config.hidden_size}, Head input: {head_input_size}, "
+          f"Pooler: {'yes' if pooler else 'no'}")
 
     # Build dual-head model
     model = DualHeadDeBERTa(
         encoder=encoder,
         pooler=pooler,
-        hidden_size=hidden_size,
+        hidden_size=head_input_size,
         num_labels=num_labels,
         dropout_rate=dropout_rate,
+        loss_fn_multi=loss_fn_multi,
+        loss_fn_binary=loss_fn_binary,
     )
 
     # Clean up
@@ -182,18 +214,19 @@ def load_dual_head_model(model_name: str, num_labels: int = 4, dropout_rate: flo
     return model
 
 
-def save_dual_head_model(model, tokenizer, save_dir):
+def save_dual_head_model(model, tokenizer, save_dir, base_model_name="microsoft/deberta-v3-small"):
     """Save model state dict, config, and tokenizer."""
     os.makedirs(save_dir, exist_ok=True)
 
     # Save model weights
     torch.save(model.state_dict(), os.path.join(save_dir, "model_state.pt"))
 
-    # Save architecture config
+    # Save architecture config (includes base_model_name for reconstruction)
     config = {
         'hidden_size': model.hidden_size,
         'num_labels': model.num_labels,
         'model_class': 'DualHeadDeBERTa',
+        'base_model_name': base_model_name,
     }
     with open(os.path.join(save_dir, "model_config.json"), 'w') as f:
         json.dump(config, f, indent=2)
@@ -201,27 +234,65 @@ def save_dual_head_model(model, tokenizer, save_dir):
     # Save tokenizer
     tokenizer.save_pretrained(save_dir)
 
+    # Tokenizer smoke test
+    try:
+        test_tok = AutoTokenizer.from_pretrained(save_dir, local_files_only=True)
+        t1 = test_tok.encode("i recommend rolling over to an ira")
+        t2 = test_tok.encode("the weather is nice today")
+        if t1[:5] == t2[:5]:
+            print(f"  WARNING: Saved tokenizer produces identical tokens — "
+                  f"inference will be broken!")
+        else:
+            print(f"  Tokenizer smoke test passed")
+        del test_tok
+    except Exception as e:
+        print(f"  Tokenizer smoke test failed: {e}")
+
     print(f"  Dual-head model saved to {save_dir}")
 
 
-def load_dual_head_from_disk(save_dir, base_model_name="microsoft/deberta-v3-small"):
+def load_dual_head_from_disk(save_dir, base_model_name=None):
     """
     Load a saved dual-head model from disk.
-    Reconstructs the architecture and loads the state dict.
+
+    Reconstructs the architecture from the saved config and loads the state dict.
+    Does NOT download pretrained weights — the state dict contains everything.
+    Still needs the base_model_name to reconstruct the encoder architecture
+    (config shapes, attention patterns, etc.) but uses from_config not from_pretrained.
     """
     config_path = os.path.join(save_dir, "model_config.json")
     state_path = os.path.join(save_dir, "model_state.pt")
 
     with open(config_path, 'r') as f:
-        config = json.load(f)
+        saved_config = json.load(f)
 
-    # Rebuild architecture (encoder weights will be overwritten by state dict)
-    model = load_dual_head_model(
-        base_model_name,
-        num_labels=config['num_labels'],
+    # Use saved base_model_name if available, fall back to parameter
+    model_name = saved_config.get('base_model_name', base_model_name or 'microsoft/deberta-v3-small')
+
+    # Build architecture from config only (no pretrained weight download)
+    print(f"  Rebuilding architecture from {model_name} config...")
+    hf_config = AutoConfig.from_pretrained(model_name, num_labels=saved_config['num_labels'])
+    ref_model = AutoModelForSequenceClassification.from_config(hf_config)
+
+    encoder = ref_model.deberta
+    pooler = ref_model.pooler if hasattr(ref_model, 'pooler') else None
+
+    if pooler is not None and hasattr(pooler, 'output_dim'):
+        head_input_size = pooler.output_dim
+    else:
+        head_input_size = hf_config.hidden_size
+
+    model = DualHeadDeBERTa(
+        encoder=encoder,
+        pooler=pooler,
+        hidden_size=head_input_size,
+        num_labels=saved_config['num_labels'],
     )
 
-    # Load saved weights (overwrites everything including encoder)
+    del ref_model
+    gc.collect()
+
+    # Load saved weights (overwrites all random initialization)
     state_dict = torch.load(state_path, map_location='cpu', weights_only=True)
     model.load_state_dict(state_dict)
     model.eval()
@@ -287,23 +358,23 @@ class FocalLoss(nn.Module):
 
 class DualHeadTrainer(Trainer):
     """
-    Trainer that computes dual-head loss (multiclass + binary).
-    Supports both CE and focal loss.
+    Trainer for dual-head model. Loss is computed in model.forward().
+    We override label_names so the Trainer collects both label columns
+    during evaluation (otherwise labels_binary gets dropped).
     """
 
-    def __init__(self, *args, loss_fn_multi=None, loss_fn_binary=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.loss_fn_multi = loss_fn_multi or F.cross_entropy
-        self.loss_fn_binary = loss_fn_binary or F.cross_entropy
+    @property
+    def label_names(self):
+        return ["labels", "labels_binary"]
+
+    @label_names.setter
+    def label_names(self, value):
+        # Trainer.__init__ tries to set this; ignore it and keep ours
+        pass
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
-
-        loss_multi = self.loss_fn_multi(outputs.multi_logits, outputs.labels)
-        loss_binary = self.loss_fn_binary(outputs.binary_logits, outputs.labels_binary)
-        loss = loss_multi + loss_binary
-
-        outputs.loss = loss
+        loss = outputs.loss
         return (loss, outputs) if return_outputs else loss
 
 
@@ -388,25 +459,47 @@ def train_dual_head(
 
     has_val = val_dataset is not None
 
-    # Load model
+    # Loss functions — focal loss or plain CE
+    loss_fn_multi = None
+    loss_fn_binary = None
+
+    if config.get('use_focal_loss', True):
+        focal_alpha = config.get('focal_alpha', 1.0)
+        focal_gamma = config.get('focal_gamma', 0.5)
+        loss_fn_multi = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        loss_fn_binary = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        print(f"  Loss: Focal (alpha={focal_alpha}, gamma={focal_gamma})")
+    else:
+        print(f"  Loss: CrossEntropy")
+
+    # Load model with loss functions attached
     model = load_dual_head_model(
         model_name,
         num_labels=config.get('num_labels', 4),
         dropout_rate=config.get('dropout_rate', 0.1),
+        loss_fn_multi=loss_fn_multi,
+        loss_fn_binary=loss_fn_binary,
     )
 
     # Metrics — logits are concatenated [multi(4), binary(2)]
     num_labels = config.get('num_labels', 4)
 
     def compute_metrics(eval_pred):
-        logits, labels_multi = eval_pred
-        # Split concatenated logits
+        logits, label_ids = eval_pred
+
+        # Trainer collects both 'labels' and 'labels_binary' into a tuple
+        if isinstance(label_ids, tuple):
+            labels_multi, binary_true = label_ids
+        else:
+            labels_multi = label_ids
+            binary_true = (labels_multi > 0).astype(int)
+
+        # Split concatenated logits [multi(4), binary(2)]
         multi_logits = logits[:, :num_labels]
         binary_logits = logits[:, num_labels:]
 
         multi_preds = np.argmax(multi_logits, axis=-1)
         binary_preds = np.argmax(binary_logits, axis=-1)
-        binary_true = (labels_multi > 0).astype(int)
 
         return {
             'f1_macro': f1_score(labels_multi, multi_preds, average='macro', zero_division=0),
@@ -455,19 +548,6 @@ def train_dual_head(
             early_stopping_threshold=0.001,
         ))
 
-    # Loss functions — focal loss or plain CE
-    loss_fn_multi = None
-    loss_fn_binary = None
-
-    if config.get('use_focal_loss', True):
-        focal_alpha = config.get('focal_alpha', 1.0)
-        focal_gamma = config.get('focal_gamma', 0.5)
-        loss_fn_multi = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-        loss_fn_binary = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-        print(f"  Loss: Focal (alpha={focal_alpha}, gamma={focal_gamma})")
-    else:
-        print(f"  Loss: CrossEntropy")
-
     trainer = DualHeadTrainer(
         model=model,
         args=training_args,
@@ -475,8 +555,6 @@ def train_dual_head(
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics if has_val else None,
         callbacks=callbacks,
-        loss_fn_multi=loss_fn_multi,
-        loss_fn_binary=loss_fn_binary,
     )
 
     trainer.train()
@@ -512,7 +590,7 @@ def train_dual_head(
 
     # Save
     model_path = os.path.join(output_dir, "best_model")
-    save_dual_head_model(model, tokenizer, model_path)
+    save_dual_head_model(model, tokenizer, model_path, base_model_name=model_name)
 
     # Free memory
     del trainer, model
@@ -681,13 +759,12 @@ class DualHeadScorer:
     Multiclass probs tell reviewers which type of advice.
     """
 
-    def __init__(self, model_dir, base_model_name="microsoft/deberta-v3-small",
-                 max_length=320, batch_size=64):
+    def __init__(self, model_dir, max_length=320, batch_size=64):
         self.max_length = max_length
         self.batch_size = batch_size
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-        self.model = load_dual_head_from_disk(model_dir, base_model_name)
+        self.model = load_dual_head_from_disk(model_dir)
         self.model.eval()
 
         self.device = get_device()

@@ -52,7 +52,6 @@ from tqdm import tqdm
 
 import torch
 from setfit import SetFitModel
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     classification_report, accuracy_score, f1_score,
@@ -81,11 +80,9 @@ class HybridConfig:
     # ── SetFit model ──
     setfit_model_path: str = "models/hybrid/setfit/final_model/setfit"
 
-    # ── DeBERTa model ──
-    deberta_model_path: str = "models/hybrid/deberta/final_model/best_model"
+    # ── DeBERTa model (dual-head: binary + multiclass) ──
+    deberta_model_path: str = "models/deberta_distribution/final_model/best_model"
     deberta_max_length: int = 320
-    deberta_use_onnx: bool = True
-    deberta_calibration_path: Optional[str] = "models/hybrid/deberta/temperature_scaler.pt"
 
     # ── Routing ──
     # 'borderline_only': SetFit confident high or low → skip DeBERTa, middle → rescore
@@ -185,99 +182,41 @@ class MulticlassCalibrator:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DeBERTa Scorer (minimal — loads one model, scores batches)
+# DeBERTa Scorer (dual-head: binary + multiclass)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DeBERTaScorer:
     """
-    Loads a single DeBERTa model for rescoring borderline snippets.
-    Supports ONNX Runtime for fast CPU inference.
+    Wraps the dual-head DeBERTa model for use in the hybrid pipeline.
+    Returns both multiclass and binary probabilities.
     """
 
     def __init__(self, config: HybridConfig):
         self.config = config
-        self.tokenizer = None
-        self.onnx_session = None
-        self.model = None
+        self.scorer = None
         self._load()
 
     def _load(self):
-        model_path = self.config.deberta_model_path
-
-        # Tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-
-        # Try ONNX first
-        if self.config.deberta_use_onnx:
-            try:
-                import onnxruntime as ort
-                ort.set_default_logger_severity(3)
-
-                model_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
-                onnx_quant = os.path.join(model_dir, "model_quantized.onnx")
-                onnx_regular = os.path.join(model_dir, "model.onnx")
-
-                onnx_file = None
-                if os.path.exists(onnx_quant):
-                    onnx_file = onnx_quant
-                elif os.path.exists(onnx_regular):
-                    onnx_file = onnx_regular
-
-                if onnx_file:
-                    sess_options = ort.SessionOptions()
-                    sess_options.inter_op_num_threads = os.cpu_count()
-                    sess_options.intra_op_num_threads = os.cpu_count()
-                    self.onnx_session = ort.InferenceSession(onnx_file, sess_options)
-                    logger.info(f"  DeBERTa loaded (ONNX): {onnx_file}")
-                    return
-
-            except ImportError:
-                pass
-
-        # PyTorch fallback
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_path, local_files_only=True
-        )
-        self.model.eval()
-        logger.info(f"  DeBERTa loaded (PyTorch): {model_path}")
-
-    def score_batch(self, texts: List[str]) -> np.ndarray:
-        """Score a batch, returns probs shape (n, num_labels)."""
-        if not texts:
-            return np.array([])
-
-        encodings = self.tokenizer(
-            texts,
+        from dual_head_deberta import DualHeadScorer
+        self.scorer = DualHeadScorer(
+            model_dir=self.config.deberta_model_path,
             max_length=self.config.deberta_max_length,
-            padding=True,
-            truncation=True,
-            return_tensors='pt' if self.model else 'np',
+            batch_size=self.config.deberta_batch_size,
         )
+        logger.info(f"  DeBERTa dual-head loaded from {self.config.deberta_model_path}")
 
-        if self.onnx_session:
-            # Convert to numpy if needed
-            input_ids = encodings['input_ids']
-            attention_mask = encodings['attention_mask']
-            if isinstance(input_ids, torch.Tensor):
-                input_ids = input_ids.numpy()
-                attention_mask = attention_mask.numpy()
+    def score_batch(self, texts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Returns:
+            multi_probs:  (n, 4) — 4-class probabilities
+            binary_probs: (n, 2) — [no_advice_prob, advice_prob]
+        """
+        return self.scorer.score_batch(texts)
 
-            logits = self.onnx_session.run(
-                ['logits'],
-                {'input_ids': input_ids, 'attention_mask': attention_mask}
-            )[0]
-            probs = _softmax(logits)
-        else:
-            with torch.no_grad():
-                outputs = self.model(**encodings)
-                probs = torch.softmax(outputs.logits, dim=-1).numpy()
-
-        return probs
-
-
-def _softmax(x):
-    e = np.exp(x - np.max(x, axis=-1, keepdims=True))
-    return e / e.sum(axis=-1, keepdims=True)
+    def score_batch_multi_only(self, texts: List[str]) -> np.ndarray:
+        """Legacy interface — returns only multiclass probs."""
+        multi, _ = self.scorer.score_batch(texts)
+        return multi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -328,18 +267,20 @@ class HybridScorer:
         self,
         texts: List[str],
         on_batch_scored: Optional[callable] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Score all texts with hybrid routing.
 
         Returns:
-            probs: (n, num_labels) — final calibrated probabilities
+            probs: (n, num_labels) — final multiclass probabilities
+            binary_score: (n,) — probability of advice (from binary head where available)
             agreement: (n,) — confidence signal (0.5 = models disagreed, 1.0 = agreed or confident)
             rescored: (n,) bool — True if DeBERTa was used for this snippet
         """
         n = len(texts)
         if n == 0:
-            return np.array([]), np.array([]), np.array([], dtype=bool)
+            empty = np.array([])
+            return empty, empty, empty, np.array([], dtype=bool)
 
         # ── Pass 1: SetFit scores everything ──
         logger.info(f"  Pass 1: SetFit scoring {n:,} snippets...")
@@ -388,34 +329,41 @@ class HybridScorer:
 
         # ── Pass 2: DeBERTa rescores selected snippets ──
         final_probs = setfit_probs.copy()
-        agreement = np.ones(n)  # non-rescored cases get 1.0
+        # Binary score: for SetFit-only snippets, derive from advice_scores
+        binary_score = advice_scores.copy()
+        agreement = np.ones(n)
         rescored = np.zeros(n, dtype=bool)
 
         if n_rescore > 0:
             rescore_texts = [texts[i] for i in rescore_indices]
 
-            logger.info(f"\n  Pass 2: DeBERTa rescoring {n_rescore:,} snippets...")
+            logger.info(f"\n  Pass 2: DeBERTa dual-head rescoring {n_rescore:,} snippets...")
             t0 = time.time()
-            deberta_probs = self._deberta_score_all(rescore_texts)
+            deberta_multi, deberta_binary = self._deberta_score_all(rescore_texts)
             deberta_time = time.time() - t0
             logger.info(f"    DeBERTa complete: {deberta_time:.1f}s "
                         f"({n_rescore / max(deberta_time, 0.01):.0f} snippets/sec)")
 
-            # Blend: DeBERTa primary, SetFit as prior
+            # Blend multiclass probs: DeBERTa primary, SetFit as prior
             w_d = self.config.borderline_deberta_weight
             w_s = self.config.borderline_setfit_weight
             w_total = w_d + w_s
 
             for j, orig_idx in enumerate(rescore_indices):
                 blended = (
-                    w_d * deberta_probs[j] + w_s * setfit_probs[orig_idx]
+                    w_d * deberta_multi[j] + w_s * setfit_probs[orig_idx]
                 ) / w_total
                 final_probs[orig_idx] = blended
 
-                # Agreement: do SetFit and DeBERTa agree on the top class?
-                setfit_pred = np.argmax(setfit_probs[orig_idx])
-                deberta_pred = np.argmax(deberta_probs[j])
-                agreement[orig_idx] = 1.0 if setfit_pred == deberta_pred else 0.5
+                # Binary score: use DeBERTa's dedicated binary head directly
+                # This is the primary ranking signal — it was trained specifically
+                # to answer "is this advice?" with no competing 4-class objective
+                binary_score[orig_idx] = float(deberta_binary[j, 1])
+
+                # Agreement: do SetFit and DeBERTa agree on advice vs no-advice?
+                setfit_says_advice = advice_scores[orig_idx] > 0.5
+                deberta_says_advice = deberta_binary[j, 1] > 0.5
+                agreement[orig_idx] = 1.0 if setfit_says_advice == deberta_says_advice else 0.5
 
             # Log agreement stats
             rescore_agreement = agreement[rescore_indices]
@@ -449,7 +397,7 @@ class HybridScorer:
                     agreement[rescore_indices],
                 )
 
-        return final_probs, agreement, rescored
+        return final_probs, binary_score, agreement, rescored
 
     def _setfit_score_all(self, texts: List[str]) -> np.ndarray:
         """Score all texts with SetFit in batches."""
@@ -468,17 +416,19 @@ class HybridScorer:
 
         return np.concatenate(all_probs, axis=0)
 
-    def _deberta_score_all(self, texts: List[str]) -> np.ndarray:
-        """Score texts with DeBERTa in batches."""
-        all_probs = []
+    def _deberta_score_all(self, texts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        """Score texts with dual-head DeBERTa. Returns (multi_probs, binary_probs)."""
+        all_multi = []
+        all_binary = []
         bs = self.config.deberta_batch_size
 
         for start in tqdm(range(0, len(texts), bs), desc="DeBERTa rescoring"):
             batch = texts[start:start + bs]
-            probs = self.deberta.score_batch(batch)
-            all_probs.append(probs)
+            multi, binary = self.deberta.score_batch(batch)
+            all_multi.append(multi)
+            all_binary.append(binary)
 
-        return np.concatenate(all_probs, axis=0)
+        return np.concatenate(all_multi), np.concatenate(all_binary)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -523,9 +473,11 @@ def tune_routing_thresholds(
     setfit_probs = scorer._setfit_score_all(val_texts)
 
     logger.info("  Scoring val set with DeBERTa (full — for threshold simulation)...")
-    deberta_probs = scorer._deberta_score_all(val_texts)
+    deberta_multi, deberta_binary = scorer._deberta_score_all(val_texts)
 
     advice_scores = setfit_probs[:, 1:].max(axis=1)
+    # Binary score from DeBERTa's dedicated head (used for ranking simulation)
+    deberta_binary_scores = deberta_binary[:, 1]
 
     w_d = config.borderline_deberta_weight
     w_s = config.borderline_setfit_weight
@@ -537,18 +489,23 @@ def tune_routing_thresholds(
     results = []
 
     if config.routing_mode == 'verify_advice':
-        # Single threshold: everything above it goes to DeBERTa
         for skip_th in verify_candidates:
             final = setfit_probs.copy()
+            # Simulate binary_score: SetFit advice_score where not rescored,
+            # DeBERTa binary_score where rescored
+            sim_binary = advice_scores.copy()
             rescore = advice_scores > skip_th
             n_rescore = rescore.sum()
 
             if n_rescore > 0:
                 final[rescore] = (
-                    w_d * deberta_probs[rescore] + w_s * setfit_probs[rescore]
+                    w_d * deberta_multi[rescore] + w_s * setfit_probs[rescore]
                 ) / w_total
+                sim_binary[rescore] = deberta_binary_scores[rescore]
 
-            preds = np.argmax(final, axis=1)
+            # Use binary_score for thresholding (matches production behavior)
+            preds = np.where(sim_binary >= config.advice_threshold,
+                             np.argmax(final[:, 1:], axis=1) + 1, 0)
             f1 = f1_score(val_labels, preds, average='macro', zero_division=0)
             acc = accuracy_score(val_labels, preds)
             prec = precision_score(val_labels, preds, average='macro', zero_division=0)
@@ -581,15 +538,18 @@ def tune_routing_thresholds(
                     continue
 
                 final = setfit_probs.copy()
+                sim_binary = advice_scores.copy()
                 rescore = (advice_scores < accept_th) & (advice_scores > reject_th)
                 n_rescore = rescore.sum()
 
                 if n_rescore > 0:
                     final[rescore] = (
-                        w_d * deberta_probs[rescore] + w_s * setfit_probs[rescore]
+                        w_d * deberta_multi[rescore] + w_s * setfit_probs[rescore]
                     ) / w_total
+                    sim_binary[rescore] = deberta_binary_scores[rescore]
 
-                preds = np.argmax(final, axis=1)
+                preds = np.where(sim_binary >= config.advice_threshold,
+                                 np.argmax(final[:, 1:], axis=1) + 1, 0)
                 f1 = f1_score(val_labels, preds, average='macro', zero_division=0)
                 acc = accuracy_score(val_labels, preds)
                 prec = precision_score(val_labels, preds, average='macro', zero_division=0)
@@ -637,7 +597,7 @@ def calibrate_hybrid(
     config.calibrator_path = None
 
     scorer = HybridScorer(config)
-    probs, _, _ = scorer.score_all(val_texts)
+    probs, _, _, _ = scorer.score_all(val_texts)
 
     config.calibrator_path = orig_cal
 
@@ -784,7 +744,7 @@ def run_inference_pipeline(input_csv, output_csv, config, ranked_output_csv=None
 
     # Score
     snippet_texts = candidates_df['snippet_text'].tolist()
-    probs, agreement, rescored = scorer.score_all(
+    probs, binary_score, agreement, rescored = scorer.score_all(
         snippet_texts,
         on_batch_scored=on_batch_scored if stream_file else None,
     )
@@ -806,8 +766,17 @@ def run_inference_pipeline(input_csv, output_csv, config, ranked_output_csv=None
     candidates_df['advice_score'] = advice_probs.max(axis=1)
     candidates_df['advice_label'] = advice_probs.argmax(axis=1) + 1
     candidates_df['advice_label_name'] = candidates_df['advice_label'].map(config.label_names)
+
+    # Binary score: the primary ranking signal.
+    # For DeBERTa-rescored snippets, this comes from the dedicated binary head
+    # (trained specifically to answer "is this advice at all?").
+    # For SetFit-only snippets, it's the sum of advice class probabilities.
+    candidates_df['binary_score'] = binary_score
+
+    # Combined score for ranking: binary_score is primary, agreement and
+    # preliminary_score are secondary signals
     candidates_df['combined_score'] = (
-        candidates_df['advice_score'] *
+        candidates_df['binary_score'] *
         candidates_df['ensemble_agreement'] *
         (1 + candidates_df['preliminary_score']) / 2
     )
@@ -821,12 +790,22 @@ def run_inference_pipeline(input_csv, output_csv, config, ranked_output_csv=None
     logger.info("AGGREGATION")
     logger.info("=" * 60)
 
+    # Multi-snippet evidence: count how many snippets per call score as advice
+    advice_snippet_counts = (
+        candidates_df[candidates_df['binary_score'] >= config.advice_threshold]
+        .groupby('INTERACTION_ID').size()
+        .reset_index(name='n_advice_snippets')
+    )
+
     best_per_call = (
         candidates_df.sort_values('combined_score', ascending=False)
         .groupby('INTERACTION_ID').first().reset_index()
     )
+    best_per_call = best_per_call.merge(advice_snippet_counts, on='INTERACTION_ID', how='left')
+    best_per_call['n_advice_snippets'] = best_per_call['n_advice_snippets'].fillna(0).astype(int)
+
     best_per_call['predicted_label'] = np.where(
-        best_per_call['advice_score'] >= config.advice_threshold,
+        best_per_call['binary_score'] >= config.advice_threshold,
         best_per_call['advice_label'], 0
     )
     best_per_call['predicted_label_name'] = best_per_call['predicted_label'].map(config.label_names)
@@ -834,7 +813,8 @@ def run_inference_pipeline(input_csv, output_csv, config, ranked_output_csv=None
 
     merge_cols = [
         'INTERACTION_ID', 'predicted_label', 'predicted_label_name',
-        'advice_score', 'combined_score', 'ensemble_agreement', 'scored_by',
+        'binary_score', 'advice_score', 'combined_score',
+        'ensemble_agreement', 'scored_by', 'n_advice_snippets',
         'snippet_text', 'trigger_phrase', 'tier', 'has_negation',
         'has_distribution_topic',
         'prob_no_advice', 'prob_roll_to_ira', 'prob_stay_in_plan', 'prob_roll_to_other_plan',
@@ -845,11 +825,13 @@ def run_inference_pipeline(input_csv, output_csv, config, ranked_output_csv=None
     # Fill calls with no candidates
     result['predicted_label'] = result['predicted_label'].fillna(0).astype(int)
     result['predicted_label_name'] = result['predicted_label_name'].fillna('no_advice')
+    result['binary_score'] = result['binary_score'].fillna(0.0)
     result['advice_score'] = result['advice_score'].fillna(0.0)
     result['combined_score'] = result['combined_score'].fillna(0.0)
     result['ensemble_agreement'] = result['ensemble_agreement'].fillna(0.0)
     result['scored_by'] = result['scored_by'].fillna('none')
     result['n_candidates'] = result['n_candidates'].fillna(0).astype(int)
+    result['n_advice_snippets'] = result['n_advice_snippets'].fillna(0).astype(int)
     result['snippet_text'] = result['snippet_text'].fillna('')
     result['trigger_phrase'] = result['trigger_phrase'].fillna('')
     result['tier'] = result['tier'].fillna(0).astype(int)
@@ -903,11 +885,12 @@ def run_inference_pipeline(input_csv, output_csv, config, ranked_output_csv=None
 def _empty_result(df, output_csv):
     result = df.copy()
     for col, val in [('predicted_label', 0), ('predicted_label_name', 'no_advice'),
-                     ('call_score', 0.0), ('combined_score', 0.0),
-                     ('ensemble_agreement', 0.0), ('scored_by', 'none'),
-                     ('top_snippet', ''), ('trigger_phrase', ''),
-                     ('stage1_tier', 0), ('negation_flag', False),
-                     ('n_candidates', 0)]:
+                     ('call_score', 0.0), ('binary_score', 0.0),
+                     ('combined_score', 0.0), ('ensemble_agreement', 0.0),
+                     ('scored_by', 'none'), ('top_snippet', ''),
+                     ('trigger_phrase', ''), ('stage1_tier', 0),
+                     ('negation_flag', False), ('n_candidates', 0),
+                     ('n_advice_snippets', 0)]:
         result[col] = val
     os.makedirs(os.path.dirname(output_csv) or '.', exist_ok=True)
     result.to_csv(output_csv, index=False)
@@ -930,7 +913,6 @@ def main_inference():
             deberta_model_path=tuned.get('deberta_model_path', 'models/deberta_distribution/final_model/best_model'),
             routing_mode=tuned.get('routing_mode', 'verify_advice'),
             calibrator_path=tuned.get('calibrator_path', 'models/hybrid/calibrator.pkl'),
-            deberta_use_onnx=True,
             stream_output_csv="output/early_alerts.csv",
             watch_column="RECOMMENDATION_FLAG",
             watch_value="N",
@@ -948,7 +930,6 @@ def main_inference():
             setfit_model_path="models/setfit_ensemble/final_model/setfit",
             deberta_model_path="models/deberta_distribution/final_model/best_model",
             routing_mode='verify_advice',
-            deberta_use_onnx=True,
             stream_output_csv="output/early_alerts.csv",
             watch_column="RECOMMENDATION_FLAG",
             watch_value="N",
